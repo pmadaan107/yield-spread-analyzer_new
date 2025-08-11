@@ -374,6 +374,6 @@ with c3:
 
 st.caption("Data via FRED/OECD; for non-US countries, probability targets inverted-curve risk rather than official recession dates.")
 
-    st.download_button("⬇️ Download probabilities (CSV)", data=to_csv(prob_series.to_frame("PROB")), file_name=f"{country}_prob.csv", mime="text/csv")
+st.download_button("⬇️ Download probabilities (CSV)", data=to_csv(prob_series.to_frame("PROB")), file_name=f"{country}_prob.csv", mime="text/csv")
 
 st.caption("Data via FRED/OECD; for non-US countries, probability targets inverted-curve risk rather than official recession dates.")
