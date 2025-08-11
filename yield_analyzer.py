@@ -59,12 +59,26 @@ st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
 # FRED CSV helper (works on Streamlit Cloud without pandas_datareader)
 
 def fred_series(series_id: str, start=None, end=None) -> pd.DataFrame:
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    s = pd.read_csv(url, parse_dates=["DATE"]).rename(columns={series_id: series_id})
-    s = s.set_index("DATE").sort_index()
+    """Robust FRED loader.
+    First try the stable 'downloaddata' CSV (DATE,VALUE). If that fails, fall back to fredgraph.csv.
+    """
+    # 1) Preferred: downloaddata endpoint
+    url1 = f"https://fred.stlouisfed.org/series/{series_id}/downloaddata/{series_id}.csv"
+    try:
+        s = pd.read_csv(url1, parse_dates=["DATE"]).rename(columns={"VALUE": series_id})
+        s = s.set_index("DATE").sort_index()
+    except Exception:
+        # 2) Fallback: fredgraph.csv?id=SERIES plus explicit start/end
+        url2 = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        s = pd.read_csv(url2, parse_dates=["DATE"]).rename(columns={series_id: series_id})
+        s = s.set_index("DATE").sort_index()
+
+    # Coerce to numeric and clean
     s[series_id] = pd.to_numeric(s[series_id], errors="coerce")
-    if start: s = s[s.index >= pd.to_datetime(start)]
-    if end:   s = s[s.index <= pd.to_datetime(end)]
+    if start:
+        s = s[s.index >= pd.to_datetime(start)]
+    if end:
+        s = s[s.index <= pd.to_datetime(end)]
     return s
 
 # Country → OECD/FRED series map (monthly)
@@ -356,6 +370,10 @@ with c2:
         fc_df = pd.DataFrame({"Forecast": fc_mean, "Lower95": fc_lower, "Upper95": fc_upper})
         st.download_button("⬇️ Download forecast (CSV)", data=to_csv(fc_df), file_name=f"{country}_forecast.csv", mime="text/csv")
 with c3:
+    st.download_button("⬇️ Download probabilities (CSV)", data=to_csv(prob_series.to_frame("PROB")), file_name=f"{country}_prob.csv", mime="text/csv")
+
+st.caption("Data via FRED/OECD; for non-US countries, probability targets inverted-curve risk rather than official recession dates.")
+
     st.download_button("⬇️ Download probabilities (CSV)", data=to_csv(prob_series.to_frame("PROB")), file_name=f"{country}_prob.csv", mime="text/csv")
 
 st.caption("Data via FRED/OECD; for non-US countries, probability targets inverted-curve risk rather than official recession dates.")
