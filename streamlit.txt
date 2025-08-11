@@ -1,5 +1,0 @@
-streamlit
-pandas
-pandas-datareader
-statsmodels
-plotly
