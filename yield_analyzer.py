@@ -1,21 +1,20 @@
+# =========================
+# Colab-friendly launcher
+# =========================
+# This cell:
+# 1) Installs dependencies
+# 2) Writes the Streamlit app to app.py
+# 3) Launches Streamlit with a public URL in Colab
+
+import sys, subprocess, textwrap, os, io
+
+# 1) Install deps (safe to run in Colab; no-op if already present)
+deps = ["streamlit", "pandas", "numpy", "scipy", "matplotlib", "requests", "pyngrok==4.1.1", "lxml"]
+subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + deps, check=False)
+
+# 2) Write the app code to app.py
+app_code = r"""
 # app.py
-"""
-Bond Scenario Pricer – Simple Website (Streamlit)
--------------------------------------------------
-Enter a bond's coupon, maturity, payment frequency, and optional OAS (spread),
-then analyze how changes in the **government yield curve** (flatten/steepen/parallel)
-affect the bond **price today** and the **price at a chosen year before maturity**.
-
-This app supports:
-- Live gov't curves (Bank of Canada / US Treasury) or manual/example points
-- Scenario engine: parallel shift, steepen, flatten (short vs long end)
-- Pricing off the zero curve + OAS
-- Duration/convexity
-- Horizon (year t) price before maturity, with two modes:
-  A) Carry/Roll-down (today's curve rolled to horizon)
-  B) Scenario-at-horizon (apply your chosen curve shift at horizon)
-"""
-
 from __future__ import annotations
 import numpy as np
 import pandas as pd
@@ -25,6 +24,7 @@ from scipy.interpolate import CubicSpline
 import requests
 from dataclasses import dataclass
 from datetime import date, timedelta
+import xml.etree.ElementTree as ET
 
 st.set_page_config(page_title="Bond Scenario Pricer", layout="wide")
 st.title("💹 Bond Scenario Pricer – Government Curve Impact")
@@ -43,7 +43,6 @@ def build_zero_curve(tenors: np.ndarray, rates: np.ndarray):
         return cs(np.clip(t, x.min(), x.max()))
     return z
 
-
 def apply_two_point_shift(zf, short_bps: float, long_bps: float, pivot: float = 5.0):
     s = short_bps / 10000.0
     l = long_bps / 10000.0
@@ -51,7 +50,6 @@ def apply_two_point_shift(zf, short_bps: float, long_bps: float, pivot: float = 
         t = np.asarray(t, float)
         return zf(t) + np.where(t <= pivot, s, l)
     return z
-
 
 def year_fractions(n, freq):
     return np.arange(1, n + 1) / freq
@@ -70,7 +68,6 @@ class Results:
     macaulay: float
     mod_dur: float
     conv: float
-
 
 def price_bond_zero(bond: Bond, zf) -> Results:
     n = int(round(bond.maturity * bond.freq))
@@ -96,7 +93,6 @@ def price_bond_zero(bond: Bond, zf) -> Results:
     conv = (p_up + p_dn - 2 * price) / (price * eps ** 2)
     return Results(price, macaulay, mod_dur, conv)
 
-
 def solve_flat_ytm(price: float, bond: Bond, guess: float = 0.04) -> float:
     n = int(round(bond.maturity * bond.freq))
     c = bond.coupon * bond.face / bond.freq
@@ -121,41 +117,64 @@ def solve_flat_ytm(price: float, bond: Bond, guess: float = 0.04) -> float:
 
 @st.cache_data(ttl=3600)
 def fetch_boc_latest():
-    url = "https://www.bankofcanada.ca/valet/observations/group/bond_yields/json?recent=1"
-    r = requests.get(url, timeout=10)
+    """
+    Bank of Canada Selected Bond Yields via Valet JSON (recent=1).
+    Series:
+      V39056: 2y, V39059: 3y, V39057: 5y, V39060: 7y, V39058: 10y, V39062: >10y proxy 30y
+    """
+    series = ["V39056","V39059","V39057","V39060","V39058","V39062"]
+    url = "https://www.bankofcanada.ca/valet/observations/{}/json?recent=1".format(",".join(series))
+    r = requests.get(url, timeout=10, headers={"User-Agent": "bond-pricer/1.0"})
     r.raise_for_status()
-    obs = r.json()["observations"][0]
-    # Map: series -> tenor years
-    mp = {"V39056": 2, "V39059": 3, "V39057": 5, "V39060": 7, "V39058": 10, "V39062": 30}
+    js = r.json()
+    obs = js.get("observations", [])
+    if not obs:
+        raise ValueError("BoC: no observations returned")
+    row = obs[-1]
+    mapping = {"V39056": 2, "V39059": 3, "V39057": 5, "V39060": 7, "V39058": 10, "V39062": 30}
     ten, rt = [], []
-    for code, yr in mp.items():
-        if code in obs and "v" in obs[code]:
+    for code, yr in mapping.items():
+        d = row.get(code)
+        if isinstance(d, dict) and "v" in d and d["v"] not in (None, ""):
             ten.append(float(yr))
-            rt.append(float(obs[code]["v"]) / 100.0)
+            rt.append(float(d["v"]) / 100.0)
     if not ten:
-        raise ValueError("BoC data missing")
-    o = np.argsort(ten)
-    return np.array(ten)[o], np.array(rt)[o]
+        raise ValueError("BoC: could not parse any yields")
+    order = np.argsort(ten)
+    return np.array(ten)[order], np.array(rt)[order]
 
 @st.cache_data(ttl=3600)
 def fetch_treasury_latest():
-    today = date.today(); start = today - timedelta(days=14)
-    base = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/daily_treasury_yield_curve"
-    params = {"filter": f"record_date:gte:{start.isoformat()}", "sort": "-record_date", "page[number]": 1, "page[size]": 1}
-    r = requests.get(base, params=params, timeout=10)
+    """
+    US Treasury Daily Par Yield Curve (XML) - current month, latest day.
+    Uses fields: bc_1year, bc_2year, bc_3year, bc_5year, bc_7year, bc_10year, bc_20year, bc_30year
+    """
+    ym = date.today().strftime("%Y%m")
+    url = ("https://home.treasury.gov/resource-center/data-chart-center/"
+           "interest-rates/pages/xml?data=daily_treasury_yield_curve"
+           f"&field_tdr_date_value_month={ym}")
+    r = requests.get(url, timeout=10, headers={"User-Agent": "bond-pricer/1.0"})
     r.raise_for_status()
-    rec = r.json()["data"][0]
-    fields = {"1_yr":1, "2_yr":2, "3_yr":3, "5_yr":5, "7_yr":7, "10_yr":10, "20_yr":20, "30_yr":30}
+    root = ET.fromstring(r.content)
+    entries = root.findall(".//entry")
+    if not entries:
+        raise ValueError("Treasury XML: no entries for current month")
+    last = entries[-1]
+    fields = [
+        ("bc_1year", 1), ("bc_2year", 2), ("bc_3year", 3),
+        ("bc_5year", 5), ("bc_7year", 7), ("bc_10year", 10),
+        ("bc_20year", 20), ("bc_30year", 30),
+    ]
     ten, rt = [], []
-    for f, yr in fields.items():
-        key = f"yield_curve_{f}"
-        v = rec.get(key)
-        if v not in (None, ""):
-            ten.append(float(yr)); rt.append(float(v)/100.0)
+    for tag, yr in fields:
+        el = last.find(f".//{tag}")
+        if el is not None and el.text not in (None, "", "N/A"):
+            ten.append(float(yr))
+            rt.append(float(el.text) / 100.0)
     if not ten:
-        raise ValueError("Treasury data missing")
-    o = np.argsort(ten)
-    return np.array(ten)[o], np.array(rt)[o]
+        raise ValueError("Treasury XML: no usable latest rates")
+    order = np.argsort(ten)
+    return np.array(ten)[order], np.array(rt)[order]
 
 # =============================
 # Sidebar controls
@@ -280,29 +299,26 @@ else:
     if hor >= mat:
         st.warning("Horizon must be strictly before maturity.")
     else:
-        # Remaining maturity and cash flows after t
-        rem_maturity = mat - hor
-        # Roll-down (carry-only) uses the same zero curve but evaluated at remaining maturities
-        # To compute **theoretical** horizon price P(t), discount remaining cash flows from t using the same curve
-        # then divide by discount factor to t (i.e., forward price from today): P_fwd(0->t) = PV0(remaining)/DF0(t)
+        # Remaining cash flows after horizon t
         n_total = int(round(mat * bond.freq))
         pay_times = year_fractions(n_total, bond.freq)  # times from 0
-        # Select payments strictly after t
         after_mask = pay_times > hor + 1e-10
         t_after = pay_times[after_mask]
-        # Cash flows
         c = bond.coupon * bond.face / bond.freq
         cf = np.full_like(t_after, c)
         if len(cf) > 0:
-            cf[-1] += bond.face if abs(t_after[-1] - mat) < 1e-8 else 0.0
-        # Present value at 0 of remaining CFs using base curve (carry-only)
+            # Add principal at maturity
+            if abs(t_after[-1] - mat) < 1e-8:
+                cf[-1] += bond.face
+
         oas = bond.oas_bps / 10000.0
+        # Carry/Roll-down: discount with base curve
         z0 = z_base(t_after) + oas
         pv0_remaining = float(np.sum(cf * np.exp(-z0 * t_after)))
         df0_t = float(np.exp(-(z_base(hor) + oas) * hor))
         price_at_t_carry = pv0_remaining / df0_t
 
-        # Scenario-at-horizon: apply scenario curve for discounting from t onward
+        # Scenario-at-horizon: discount with scenario curve
         zS = z_shift(t_after) + oas
         pv0_remaining_s = float(np.sum(cf * np.exp(-zS * t_after)))
         df0_t_s = float(np.exp(-(z_shift(hor) + oas) * hor))
@@ -318,21 +334,39 @@ else:
             ],
             "Value": [
                 hor,
-                round(rem_maturity, 4),
+                round(mat - hor, 4),
                 round(price_at_t_carry, 4),
                 round(price_at_t_scenario, 4),
                 round(price_at_t_scenario - price_at_t_carry, 4)
             ]
         })
         st.dataframe(htab, hide_index=True, use_container_width=True)
-        st.caption("Carry/Roll-down uses today's base curve to value the future price implied today. Scenario-at-horizon applies your chosen curve shift at time t before discounting.")
 
-# =============================
-# Help
-# =============================
 with st.expander("ℹ️ Notes"):
     st.markdown("""
-- **Steepen/Flatten**: Short end (≤ pivot) vs long end (> pivot) are moved by ±Magnitude (bps).
-- **OAS**: Constant spread added to the zero curve for the bond; we hold it fixed across scenarios.
-- **Horizon Price**: Forward price implied today. Carry = no extra shock; Scenario-at-horizon = apply your curve shift at t.
+- **Steepen/Flatten**: Short end (≤ pivot) vs long end (> pivot) move by ±Magnitude (bps).
+- **OAS**: Constant spread added to the zero curve for the bond; held fixed across scenarios.
+- **Horizon Price**: Carry = no extra shock; Scenario-at-horizon = apply your curve shift at t.
 """)
+"""
+
+with open("app.py", "w", encoding="utf-8") as f:
+    f.write(app_code)
+
+# 3) Launch Streamlit (Colab only): use ngrok to get a public URL
+from pyngrok import ngrok
+# Kill existing tunnels
+try:
+    ngrok.kill()
+except Exception:
+    pass
+
+# Start streamlit
+port = 8501
+public_url = ngrok.connect(addr=port, proto="http")
+print("Public URL:", public_url)
+
+# Run streamlit as a background process
+streamlit_proc = subprocess.Popen([sys.executable, "-m", "streamlit", "run", "app.py", "--server.port", str(port), "--server.headless=true"])
+
+print("If the URL above doesn't open automatically, click it to view the app.")
