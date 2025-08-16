@@ -8,17 +8,17 @@ from scipy.interpolate import CubicSpline
 import requests
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 
-# -------------------------------
+# -------------------------------------------------
 # App setup
-# -------------------------------
+# -------------------------------------------------
 st.set_page_config(page_title="Bond Scenario Pricer", layout="wide")
 st.title("💹 Bond Scenario Pricer – Government Curve Impact")
 
-# -------------------------------
+# -------------------------------------------------
 # Helpers
-# -------------------------------
+# -------------------------------------------------
 def build_zero_curve(tenors: np.ndarray, rates: np.ndarray):
     """Return a callable zero-rate function z(t) using a natural cubic spline."""
     tenors = np.asarray(tenors, float)
@@ -27,22 +27,27 @@ def build_zero_curve(tenors: np.ndarray, rates: np.ndarray):
     x = tenors[order]
     y = rates[order]
     cs = CubicSpline(x, y, bc_type="natural")
+
     def z(t):
         t = np.asarray(t, float)
         return cs(np.clip(t, x.min(), x.max()))
     return z
 
+
 def apply_two_point_shift(zf, short_bps: float, long_bps: float, pivot: float = 5.0):
     """Short end (<= pivot) shifted by short_bps; long end (> pivot) by long_bps."""
     s = short_bps / 10000.0
     l = long_bps / 10000.0
+
     def z(t):
         t = np.asarray(t, float)
         return zf(t) + np.where(t <= pivot, s, l)
     return z
 
+
 def year_fractions(n, freq):
     return np.arange(1, n + 1) / freq
+
 
 @dataclass
 class Bond:
@@ -52,12 +57,14 @@ class Bond:
     maturity: float # years
     oas_bps: float = 0.0
 
+
 @dataclass
 class Results:
     price: float
     macaulay: float
     mod_dur: float
     conv: float
+
 
 def price_bond_zero(bond: Bond, zf) -> Results:
     """Price a fixed coupon bond off a zero curve (+OAS). Also return duration/convexity."""
@@ -75,14 +82,17 @@ def price_bond_zero(bond: Bond, zf) -> Results:
     macaulay = float((w * t).sum())
     # Effective mod duration & convexity via 1 bp move
     eps = 1e-4
+
     def price_shift(dy):
         df_s = np.exp(-(z + dy) * t)
         return float((cf * df_s).sum())
+
     p_up = price_shift(eps)
     p_dn = price_shift(-eps)
     mod_dur = (p_dn - p_up) / (2 * eps * price)
-    conv = (p_up + p_dn - 2 * price) / (price * eps**2)
+    conv = (p_up + p_dn - 2 * price) / (price * eps ** 2)
     return Results(price, macaulay, mod_dur, conv)
+
 
 def solve_flat_ytm(price: float, bond: Bond, guess: float = 0.04) -> float:
     """Conventional YTM (APR) with compounding at bond.freq (Newton)."""
@@ -103,38 +113,68 @@ def solve_flat_ytm(price: float, bond: Bond, guess: float = 0.04) -> float:
         y = max(-0.99, y)
     return float(y)
 
-# -------------------------------
-# Live curve fetchers (robust)
-# -------------------------------
+
+# -------------------------------------------------
+# Live curve fetchers (updated & robust)
+# -------------------------------------------------
 HEADERS = {"User-Agent": "bond-pricer/1.0"}
 
 @st.cache_data(ttl=3600)
 def fetch_boc_latest():
     """
-    Bank of Canada Selected Bond Yields via Valet JSON (recent=1).
-    Series:
-      V39056: 2y, V39059: 3y, V39057: 5y, V39060: 7y, V39058: 10y, V39062: >10y (proxy 30y)
+    Bank of Canada 'Selected benchmark bond yields' via Valet GROUP endpoint.
+    We read the latest observation from the group and map series labels -> tenors.
     """
-    series = ["V39056","V39059","V39057","V39060","V39058","V39062"]
-    url = "https://www.bankofcanada.ca/valet/observations/{}/json?recent=1".format(",".join(series))
+    url = "https://www.bankofcanada.ca/valet/observations/group/bond_yields_benchmark/json?recent=1"
     r = requests.get(url, timeout=10, headers=HEADERS)
     r.raise_for_status()
     js = r.json()
+
+    details = js.get("seriesDetail", {})
     obs = js.get("observations", [])
     if not obs:
-        raise ValueError("BoC: no observations returned")
-    row = obs[-1]
-    mapping = {"V39056": 2, "V39059": 3, "V39057": 5, "V39060": 7, "V39058": 10, "V39062": 30}
+        raise ValueError("BoC: no observations returned from group")
+    row = obs[-1]  # latest day
+
+    # Map label substrings -> tenor in years (normalize to lower-case)
+    label_to_tenor = {
+        "2 year": 2.0,
+        "3 year": 3.0,
+        "5 year": 5.0,
+        "7 year": 7.0,
+        "10 year": 10.0,
+        "long-term": 30.0,  # proxy 30y from long-term benchmark
+    }
+
     ten, rt = [], []
-    for code, yr in mapping.items():
-        d = row.get(code)
-        if isinstance(d, dict) and "v" in d and d["v"] not in (None, ""):
-            ten.append(float(yr))
-            rt.append(float(d["v"]) / 100.0)
+    for sid, meta in details.items():
+        label = (meta.get("label") or "").strip().lower()
+        # Find a match in our mapping by substring (handles slight label changes)
+        matched_tenor = None
+        for key, yr in label_to_tenor.items():
+            if key in label:
+                matched_tenor = yr
+                break
+        if matched_tenor is None:
+            continue
+        # Look for the value in the latest observation
+        cell = row.get(sid)
+        if isinstance(cell, dict):
+            vtxt = cell.get("v")
+        else:
+            vtxt = None
+        if vtxt not in (None, "", "NA", "N/A"):
+            ten.append(float(matched_tenor))
+            rt.append(float(vtxt) / 100.0)
+
     if not ten:
-        raise ValueError("BoC: could not parse any yields")
+        raise ValueError("BoC: could not parse benchmark yields from group JSON")
+
+    ten = np.array(ten, dtype=float)
+    rt = np.array(rt, dtype=float)
     order = np.argsort(ten)
-    return np.array(ten)[order], np.array(rt)[order]
+    return ten[order], rt[order]
+
 
 @st.cache_data(ttl=3600)
 def fetch_treasury_latest():
@@ -143,9 +183,11 @@ def fetch_treasury_latest():
     Uses fields: bc_1year, bc_2year, bc_3year, bc_5year, bc_7year, bc_10year, bc_20year, bc_30year
     """
     ym = date.today().strftime("%Y%m")
-    url = ("https://home.treasury.gov/resource-center/data-chart-center/"
-           "interest-rates/pages/xml?data=daily_treasury_yield_curve"
-           f"&field_tdr_date_value_month={ym}")
+    url = (
+        "https://home.treasury.gov/resource-center/data-chart-center/"
+        "interest-rates/pages/xml?data=daily_treasury_yield_curve"
+        f"&field_tdr_date_value_month={ym}"
+    )
     r = requests.get(url, timeout=10, headers=HEADERS)
     r.raise_for_status()
     root = ET.fromstring(r.content)
@@ -154,9 +196,14 @@ def fetch_treasury_latest():
         raise ValueError("Treasury XML: no entries for current month")
     last = entries[-1]
     fields = [
-        ("bc_1year", 1), ("bc_2year", 2), ("bc_3year", 3),
-        ("bc_5year", 5), ("bc_7year", 7), ("bc_10year", 10),
-        ("bc_20year", 20), ("bc_30year", 30),
+        ("bc_1year", 1),
+        ("bc_2year", 2),
+        ("bc_3year", 3),
+        ("bc_5year", 5),
+        ("bc_7year", 7),
+        ("bc_10year", 10),
+        ("bc_20year", 20),
+        ("bc_30year", 30),
     ]
     ten, rt = [], []
     for tag, yr in fields:
@@ -169,9 +216,10 @@ def fetch_treasury_latest():
     order = np.argsort(ten)
     return np.array(ten)[order], np.array(rt)[order]
 
-# -------------------------------
+
+# -------------------------------------------------
 # Sidebar controls
-# -------------------------------
+# -------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Inputs")
     market = st.selectbox("Market", ["Canada", "United States"], index=0)
@@ -179,37 +227,45 @@ with st.sidebar:
 
     if source == "Manual":
         st.caption("Enter tenor (years) and zero rate (%). Keep tenors increasing.")
-        manual = st.data_editor(pd.DataFrame({
-            "Tenor (yrs)": [1,2,3,5,7,10,20,30],
-            "Zero Rate (%)": [4.7,4.6,4.5,4.3,4.2,4.1,4.0,4.0]
-        }), num_rows="dynamic", use_container_width=True)
+        manual = st.data_editor(
+            pd.DataFrame(
+                {
+                    "Tenor (yrs)": [1, 2, 3, 5, 7, 10, 20, 30],
+                    "Zero Rate (%)": [4.7, 4.6, 4.5, 4.3, 4.2, 4.1, 4.0, 4.0],
+                }
+            ),
+            num_rows="dynamic",
+            use_container_width=True,
+        )
         tenors = manual["Tenor (yrs)"].to_numpy(float)
-        rates  = manual["Zero Rate (%)"].to_numpy(float) / 100.0
+        rates = manual["Zero Rate (%)"].to_numpy(float) / 100.0
     else:
         # Example fallback shapes (reasonable placeholders)
-        EX_TEN = np.array([1,2,3,5,7,10,20,30])
-        EX_CA  = np.array([0.047,0.046,0.045,0.043,0.042,0.041,0.040,0.040])
-        EX_US  = np.array([0.048,0.047,0.046,0.044,0.043,0.042,0.041,0.041])
+        EX_TEN = np.array([1, 2, 3, 5, 7, 10, 20, 30])
+        EX_CA = np.array([0.047, 0.046, 0.045, 0.043, 0.042, 0.041, 0.040, 0.040])
+        EX_US = np.array([0.048, 0.047, 0.046, 0.044, 0.043, 0.042, 0.041, 0.041])
         tenors = EX_TEN
-        rates  = EX_CA if market == "Canada" else EX_US
+        rates = EX_CA if market == "Canada" else EX_US
         if source == "Live (Govt API)":
             try:
-                tenors, rates = fetch_boc_latest() if market=="Canada" else fetch_treasury_latest()
+                tenors, rates = (
+                    fetch_boc_latest() if market == "Canada" else fetch_treasury_latest()
+                )
                 st.success("Fetched latest government curve.")
             except Exception as e:
                 st.warning(f"Live fetch failed: {e}. Using example points.")
 
     st.divider()
     st.subheader("Bond")
-    face   = st.number_input("Face Value", 0.0, 1e9, 100.0, step=1.0)
-    coup   = st.number_input("Coupon % (annual)", 0.0, 100.0, 5.0, step=0.1) / 100.0
-    freq   = st.selectbox("Payments per Year (n)", [1,2,4], index=1)
-    mat    = st.number_input("Maturity (years)", 0.25, 100.0, 10.0, step=0.25)
+    face = st.number_input("Face Value", 0.0, 1e9, 100.0, step=1.0)
+    coup = st.number_input("Coupon % (annual)", 0.0, 100.0, 5.0, step=0.1) / 100.0
+    freq = st.selectbox("Payments per Year (n)", [1, 2, 4], index=1)
+    mat = st.number_input("Maturity (years)", 0.25, 100.0, 10.0, step=0.25)
     oasbps = st.number_input("OAS / Spread (bps)", -1000.0, 2000.0, 0.0, step=5.0)
 
     st.divider()
     st.subheader("Scenario")
-    scenario = st.selectbox("Type", ["None","Parallel","Steepen","Flatten"], index=2)
+    scenario = st.selectbox("Type", ["None", "Parallel", "Steepen", "Flatten"], index=2)
     mag = st.slider("Magnitude (bps)", -300, 300, 50, step=5)
     pivot = st.slider("Pivot (years)", 1, 15, 5)
 
@@ -217,9 +273,9 @@ with st.sidebar:
     st.subheader("Horizon Pricing")
     hor = st.number_input("Horizon year before maturity (t)", 0.0, 99.0, 3.0, step=0.5)
 
-# -------------------------------
+# -------------------------------------------------
 # Build curves & scenario
-# -------------------------------
+# -------------------------------------------------
 z_base = build_zero_curve(tenors, rates)
 short_bps, long_bps = 0.0, 0.0
 if scenario == "Parallel":
@@ -230,17 +286,17 @@ elif scenario == "Flatten":
     short_bps, long_bps = mag, -mag
 z_shift = apply_two_point_shift(z_base, short_bps, long_bps, pivot=float(pivot))
 
-# -------------------------------
+# -------------------------------------------------
 # Plots – curves
-# -------------------------------
-col_curve, col_pts = st.columns([2,1])
+# -------------------------------------------------
+col_curve, col_pts = st.columns([2, 1])
 with col_curve:
     st.subheader("Government Zero Curves")
     grid = np.linspace(tenors.min(), tenors.max(), 200)
-    fig, ax = plt.subplots(figsize=(7,4))
-    ax.plot(grid, z_base(grid)*100, label="Base")
-    ax.plot(grid, z_shift(grid)*100, linestyle="--", label="Scenario")
-    ax.scatter(tenors, rates*100, marker="o", label="Points")
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(grid, z_base(grid) * 100, label="Base")
+    ax.plot(grid, z_shift(grid) * 100, linestyle="--", label="Scenario")
+    ax.scatter(tenors, rates * 100, marker="o", label="Points")
     ax.set_xlabel("Maturity (years)")
     ax.set_ylabel("Zero Rate (%)")
     ax.grid(True, alpha=0.3)
@@ -249,40 +305,52 @@ with col_curve:
 
 with col_pts:
     st.subheader("Key Tenors (%)")
-    kt = np.array([1,2,3,5,7,10])
-    dfk = pd.DataFrame({
-        "Tenor": kt,
-        "Base": np.round(z_base(kt)*100,3),
-        "Scenario": np.round(z_shift(kt)*100,3),
-        "Δ (bps)": np.round((z_shift(kt)-z_base(kt))*10000,1)
-    })
+    kt = np.array([1, 2, 3, 5, 7, 10])
+    dfk = pd.DataFrame(
+        {
+            "Tenor": kt,
+            "Base": np.round(z_base(kt) * 100, 3),
+            "Scenario": np.round(z_shift(kt) * 100, 3),
+            "Δ (bps)": np.round((z_shift(kt) - z_base(kt)) * 10000, 1),
+        }
+    )
     st.dataframe(dfk, hide_index=True, use_container_width=True)
 
-# -------------------------------
+# -------------------------------------------------
 # Pricing today
-# -------------------------------
+# -------------------------------------------------
 bond = Bond(face=face, coupon=coup, freq=int(freq), maturity=mat, oas_bps=oasbps)
-res_base   = price_bond_zero(bond, z_base)
-res_shift  = price_bond_zero(bond, z_shift)
+res_base = price_bond_zero(bond, z_base)
+res_shift = price_bond_zero(bond, z_shift)
 
 st.subheader("Price Today (off Gov't Curve + OAS)")
-ptab = pd.DataFrame({
-    "Metric": ["Price (Base)", "Price (Scenario)", "Δ Price", "Δ %", "Macaulay (y)", "ModDur", "Convexity"],
-    "Value": [
-        round(res_base.price, 4),
-        round(res_shift.price, 4),
-        round(res_shift.price - res_base.price, 4),
-        round((res_shift.price/res_base.price - 1)*100, 4),
-        round(res_base.macaulay, 4),
-        round(res_base.mod_dur, 6),
-        round(res_base.conv, 6),
-    ]
-})
+ptab = pd.DataFrame(
+    {
+        "Metric": [
+            "Price (Base)",
+            "Price (Scenario)",
+            "Δ Price",
+            "Δ %",
+            "Macaulay (y)",
+            "ModDur",
+            "Convexity",
+        ],
+        "Value": [
+            round(res_base.price, 4),
+            round(res_shift.price, 4),
+            round(res_shift.price - res_base.price, 4),
+            round((res_shift.price / res_base.price - 1) * 100, 4),
+            round(res_base.macaulay, 4),
+            round(res_base.mod_dur, 6),
+            round(res_base.conv, 6),
+        ],
+    }
+)
 st.dataframe(ptab, hide_index=True, use_container_width=True)
 
-# -------------------------------
+# -------------------------------------------------
 # Horizon price at year t < maturity
-# -------------------------------
+# -------------------------------------------------
 st.subheader("Price at a Particular Year Before Maturity")
 if hor <= 0:
     st.info("Set a positive horizon year t (e.g., 3.0)")
@@ -312,28 +380,31 @@ else:
     df0_t_s = float(np.exp(-(z_shift(hor) + oas) * hor))
     price_at_t_scenario = pv0_remaining_s / df0_t_s
 
-    htab = pd.DataFrame({
-        "Metric": [
-            "Horizon t (years)",
-            "Remaining maturity (years)",
-            "Price at t – Carry/Roll-down",
-            "Price at t – Scenario-at-horizon",
-            "Δ vs Carry"
-        ],
-        "Value": [
-            hor,
-            round(mat - hor, 4),
-            round(price_at_t_carry, 4),
-            round(price_at_t_scenario, 4),
-            round(price_at_t_scenario - price_at_t_carry, 4)
-        ]
-    })
+    htab = pd.DataFrame(
+        {
+            "Metric": [
+                "Horizon t (years)",
+                "Remaining maturity (years)",
+                "Price at t – Carry/Roll-down",
+                "Price at t – Scenario-at-horizon",
+                "Δ vs Carry",
+            ],
+            "Value": [
+                hor,
+                round(mat - hor, 4),
+                round(price_at_t_carry, 4),
+                round(price_at_t_scenario, 4),
+                round(price_at_t_scenario - price_at_t_carry, 4),
+            ],
+        }
+    )
     st.dataframe(htab, hide_index=True, use_container_width=True)
 
 with st.expander("ℹ️ Notes"):
-    st.markdown("""
+    st.markdown(
+        """
 - **Steepen/Flatten**: Short end (≤ pivot) vs long end (> pivot) move by ±Magnitude (bps).
 - **OAS**: Constant spread added to the zero curve for the bond; held fixed across scenarios.
 - **Horizon Price**: Carry = no extra shock; Scenario-at-horizon = apply your curve shift at t.
-""")
-
+"""
+    )
