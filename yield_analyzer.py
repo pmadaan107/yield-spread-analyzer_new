@@ -118,7 +118,7 @@ def solve_flat_ytm(price: float, bond: Bond, guess: float = 0.04) -> float:
 @st.cache_data(ttl=3600)
 def fetch_boc_latest():
     """
-    Bank of Canada Selected Bond Yields via Valet JSON (recent=1).
+Bank of Canada Selected Bond Yields via Valet JSON (recent=1).
     Series:
       V39056: 2y, V39059: 3y, V39057: 5y, V39060: 7y, V39058: 10y, V39062: >10y proxy 30y
     """
